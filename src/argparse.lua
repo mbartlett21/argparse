@@ -1191,10 +1191,43 @@ function Parser:add_complete_command(value)
       :description "Output a shell completion script."
    complete:argument "shell"
       :description "The shell to output a completion script for."
-      :choices {"bash", "zsh", "fish"}
+      :choices {"bash", "zsh", "fish", "powershell"}
       :action(function(_, _, shell)
-         io.write(self["get_" .. shell .. "_complete"](self))
+         if self._completion_cmdline then
+            if shell ~= "powershell" then
+               io.write("cmdline only supports PowerShell\n")
+               os.exit(1)
+            end
+            io.write(self["do_" .. shell .. "_complete"](self,
+               self._completion_cmdline,
+               self._completion_cmdpos or #self._completion_cmdline,
+               self._completion_cmdsplit
+            ))
+         else
+            io.write(self["get_" .. shell .. "_complete"](self, complete))
+         end
          os.exit(0)
+      end)
+
+   complete:option "--cmdline"
+      :description "Command line from PowerShell"
+      :hidden(true)
+      :action(function(_, _, cmdline)
+         self._completion_cmdline = cmdline
+      end)
+
+   complete:option "--cmdsplit"
+      :description "Parsed split data from PowerShell. Format is <s>,<e>;..."
+      :hidden(true)
+      :action(function(_, _, cmdsplit)
+         self._completion_cmdsplit = cmdsplit
+      end)
+
+   complete:option "--cmdpos"
+      :description "Where the cursor is currently (defaults to the end)"
+      :hidden(true)
+      :action(function(_, _, cmdpos)
+         self._completion_cmdpos = tonumber(cmdpos)
       end)
 
    if value then
@@ -1588,6 +1621,25 @@ end]]):format(self._basename, self._basename, self._basename, self._basename))
 
    self:_fish_complete_help(buf, self._basename)
    return table.concat(buf, "\n") .. "\n"
+end
+
+function Parser:get_powershell_complete(cmd)
+   self._basename = base_name(self._name)
+   assert(self:_is_shell_safe())
+
+   return string.format([[
+Register-ArgumentCompleter -Native -CommandName %s -ScriptBlock {
+   param($cmdWord, $cmdAst, $cmdPos)
+      $Local:cmdSplits = ""
+      foreach ( $arg in $cmdAst.CommandElements ) {
+          $Local:cmdSplits = "$Local:cmdSplits$($arg.Extent.StartOffset),$($arg.Extent.EndOffset);"
+      }
+      $Local:cmd = $cmdAst.ToString()
+      %s "--cmdline=$Local:cmd" --cmdpos=$cmdPos "--cmdsplit=$Local:cmdSplits" powershell | ForEach-Object {
+         [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+      }
+}
+]], self._basename, cmd:_get_fullname())
 end
 
 local function get_tip(context, wrong_name)
@@ -2048,6 +2100,279 @@ function ParseState:parse(args)
 
    self:finalize()
    return self.result
+end
+
+function ParseState:autocomplete_close()
+   if self.option then
+      self.option.open = false
+      self.option = nil
+   end
+end
+
+function ParseState:autocomplete_invoke(option, nextarg)
+   self:autocomplete_close()
+   option.args = {}
+   if option.element._maxargs > 0 then
+      self.option = option
+      option.open = true
+      if nextarg then
+         self:autocomplete_pass(nextarg)
+      end
+   end
+end
+
+function ParseState:autocomplete_pass(arg)
+   if self.option then
+      table.insert(self.option.args, arg)
+      if #self.option.args >= self.option.element._maxargs then
+         self.option.open = false
+      end
+      if not self.option.open then
+         self.option = nil
+      end
+   elseif self.argument then
+      -- self:check_mutexes(self.argument)
+      table.insert(self.argument.args, arg)
+      if #self.argument.args >= self.argument.element._maxargs then
+         self.argument_i = self.argument_i + 1
+         self.argument = self.arguments[self.argument_i]
+      end
+   else
+      local command = self.commands[arg]
+      if command then
+         self:switch(command)
+      end
+   end
+end
+
+-- we don't invoke anything in the arguments, since it is being run as an
+-- autocompleter
+--
+-- This has also been written to ignore incorrect arguments and still autocomplete
+function ParseState:autocomplete_parse(args)
+   local possible_completions
+
+   for i, arg in ipairs(args) do
+      if self.option and not self.option.args then self.option.args = {} end
+      local is_last = not args[i + 1]
+
+      local plain = true
+
+      if self.handle_options then
+         local first = arg:sub(1, 1)
+
+         if is_last then
+            possible_completions = {}
+            if arg == '' then
+               -- if there is an option waiting for an argument then
+               -- complete it
+               if self.option then
+                  if self.option.element._choices then
+                     for _, ch in ipairs(self.option.element._choices) do
+                        if ch:sub(1, #arg) == arg then
+                           table.insert(possible_completions, ch)
+                        end
+                     end
+                  end
+               else
+                  if self.argument then
+                     if self.argument.element._choices then
+                        for _, ch in ipairs(self.argument.element._choices) do
+                           if ch:sub(1, #arg) == arg then
+                              table.insert(possible_completions, ch)
+                           end
+                        end
+                     end
+                  else
+                     for k in pairs(self.commands) do
+                        if type(k) == 'string' then
+                           table.insert(possible_completions, k)
+                        end
+                     end
+                     if not possible_completions[1] then
+                        -- only do flags when there are no commands or arguments
+                        -- todo: limit mutually exclusive (mutex)
+                        for k, v in pairs(self.options) do
+                           if type(k) == 'string' then
+                              table.insert(possible_completions, k)
+                           end
+                        end
+                     end
+                  end
+               end
+            elseif self.charset[first] then
+               -- autocomplete flags/options only
+               local eq = arg:find "="
+               if eq then
+                  local n = arg:sub(1, eq - 1)
+                  local option = self.options[n]
+                  local a2 = arg:sub(eq + 1)
+                  if option and option.element._choices then
+                     for _, ch in ipairs(option.element._choices) do
+                        if ch:sub(1, #a2) == a2 then
+                           table.insert(possible_completions, n .. "=" .. ch)
+                        end
+                     end
+                  end
+               else
+                  for k in pairs(self.options) do
+                     if type(k) == 'string' and k:sub(1, #arg) == arg then
+                        table.insert(possible_completions, k)
+                     end
+                  end
+               end
+            else
+               if self.option or self.argument then
+                  local a = self.option or self.argument
+                  if a.element._choices then
+                     for _, ch in ipairs(a.element._choices) do
+                        if ch:sub(1, #arg) == arg then
+                           table.insert(possible_completions, ch)
+                        end
+                     end
+                  end
+               else
+                  for k in pairs(self.commands) do
+                     if type(k) == 'string' and k:sub(1, #arg) == arg then
+                        table.insert(possible_completions, k)
+                     end
+                  end
+               end
+            end
+            break
+         end
+
+         if self.charset[first] then
+            if #arg > 1 then
+               plain = false
+
+               if arg:sub(2, 2) == first then
+                  if #arg == 2 then
+                     self:autocomplete_invoke(self.options[arg])
+                     self.handle_options = false
+                  else
+                     local equals = arg:find "="
+                     if equals then
+                        local name = arg:sub(1, equals - 1)
+                        local option = self.options[name]
+                        self:autocomplete_invoke(option, arg:sub(equals + 1))
+                     else
+                        self:autocomplete_invoke(self.options[arg])
+                     end
+                  end
+               else
+                  for i = 2, #arg do
+                     local name = first .. arg:sub(i, i)
+                     local option = self.options[name]
+                     self:autocomplete_invoke(option)
+                     if option and i ~= #arg and option.element._maxargs > 0 then
+                        self:autocomplete_pass(arg:sub(i + 1))
+                        break
+                     end
+                  end
+               end
+            end
+         end
+      elseif is_last then
+         possible_completions = {}
+      end
+
+      if plain then
+         self:autocomplete_pass(arg)
+      end
+   end
+
+   table.sort(possible_completions, function(a, b)
+      a = a:gsub('^%W', '\xff%0')
+      b = b:gsub('^%W', '\xff%0')
+      return a < b
+   end)
+   return table.concat(possible_completions, '\n')
+end
+
+local function split_powershell_args1(cmdline) --> {string}, unfinished
+   local i = 1
+
+   local items = {}
+   while true do
+      local nex, _, c = cmdline:find("(%S)", i)
+
+      if c == "'" then
+         local sq = nex
+         local nsq
+         while true do
+            nsq = cmdline:find("'", nsq or sq + 1, true)
+            if not nsq then
+               table.insert(items, (cmdline:sub(sq):sub(2):gsub("''", "'")))
+               return items, true
+            end
+            if cmdline:sub(nsq, nsq + 2) == "''" then
+               nsq = nsq + 2
+            else
+               table.insert(items, (cmdline:sub(sq, nsq):sub(2, -2):gsub("''", "'")))
+               i = nsq + 1
+               break
+            end
+         end
+      elseif c == '"' then
+         local dq = nex
+         local ndq
+         while true do
+            ndq = cmdline:find('"', ndq or dq + 1, true)
+            if not ndq then
+               table.insert(items, (cmdline:sub(dq):sub(2):gsub('""', '"')))
+               return items, true
+            end
+            if cmdline:sub(ndq, ndq + 2) == '""' then
+               ndq = ndq + 2
+            else
+               table.insert(items, (cmdline:sub(dq, ndq):sub(2, -2):gsub('""', '"')))
+               i = ndq + 1
+               break
+            end
+         end
+      else
+         local item, itemend, mat = cmdline:find('(%S+)', i)
+         if not item then return items end
+         table.insert(items, mat)
+         i = itemend + 1
+         -- print(itemend, #cmdline)
+         if itemend == #cmdline then
+            return items, true
+         end
+      end
+   end
+   error'unreachable'
+end
+
+local function split_powershell_args(cmdline, cmdsplit) --> {string}, unfinished
+   -- defaults to half-open 0-based from powershell
+   local items = {}
+   for s, e in cmdsplit:gmatch("(%d+),(%d+)") do
+      s=tonumber(s)
+      e=tonumber(e)
+      local str = cmdline:sub(s + 1, e)
+      table.insert(items, str)
+      if e >= #cmdline then
+         return items, true
+      end
+   end
+   return items
+end
+
+function Parser:do_powershell_complete(cmdline, pos, cmdsplit)
+   if pos > #cmdline then
+      -- powershell gives pos outside the cmdline when
+      -- autocompleting something unfinished
+      cmdline = cmdline .. (" "):rep(pos - #cmdline)
+   end
+   cmdline = cmdline:sub(1, pos)
+   local args, unfinished = split_powershell_args(cmdline, cmdsplit)
+   table.remove(args, 1)
+   if not unfinished or not args[1] then table.insert(args, '') end
+
+
+   return ParseState(self):autocomplete_parse(args)
 end
 
 function Parser:error(msg)
