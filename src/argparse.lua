@@ -2111,12 +2111,14 @@ end
 
 function ParseState:autocomplete_invoke(option, nextarg)
    self:autocomplete_close()
-   option.args = {}
-   if option.element._maxargs > 0 then
-      self.option = option
-      option.open = true
-      if nextarg then
-         self:autocomplete_pass(nextarg)
+   if option then
+      option.args = {}
+      if option.element._maxargs > 0 then
+         self.option = option
+         option.open = true
+         if nextarg then
+            self:autocomplete_pass(nextarg)
+         end
       end
    end
 end
